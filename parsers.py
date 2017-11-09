@@ -5,12 +5,21 @@ import sys
 import urllib.request
 from bs4 import BeautifulSoup
 from abc import ABC, abstractmethod
+import psycopg2
 
 class AbstractParser(ABC):
     @abstractmethod
     def __init__(self, _url):
         self.props = []
         self.url = _url
+
+        # Connect to db
+        try:
+            self.conn = psycopg2.connect(dbname="rooms-japan", host="localhost", user="tiphaine", password="tiphsolange")
+            self.cur = self.conn.cursor()
+        except psycopg2.OperationalError as e:
+            print("Could not connect to database: {0}").format(e)
+            sys.exit(1)
 
 
     def get_ward(self, string):
@@ -78,7 +87,6 @@ class AbstractParser(ABC):
     def print(self, out):
         with open(out, "w") as f:
             prop_keys = self.props[0].keys()
-            ipdb.set_trace()
             f.write("\t".join(prop_keys) + "\n")
             for key in self.props:
                 f.write("\t".join(map(str, [key[x] for x in prop_keys])) + "\n")
@@ -95,8 +103,6 @@ class AbstractParser(ABC):
             yen = 0
         else:
             yen = int(yen)
-        if (man*10000 + yen) > 150000:
-            ipdb.set_trace()
         return (man*10000 + yen)
 
     def convert_surface(self, surf):
@@ -111,7 +117,7 @@ class AbstractParser(ABC):
     def load(self, infile):
         header = True
         with open(infile) as f:
-            for line in f.readlines():
+            for line in f:
                 if header:
                     # Read keys
                     keys = line.split()
@@ -124,7 +130,8 @@ class AbstractParser(ABC):
                             entry[keys[i]] = str(contents[i])
                         else:
                             entry[keys[i]] = float(contents[i])
-                        self.props.append(entry)
+                    self.props.append(entry)
+
 class Agharta(AbstractParser):
     def __init__(self, _url):
         super().__init__(_url)
@@ -147,13 +154,22 @@ class Agharta(AbstractParser):
                 properties = soup.find_all("div", class_="property-listing")
         
                 for apartment in properties:
-                    self.props.append(self.get_appt_info(apartment))
+                    p = self.get_appt_info(apartment)
+                    print(p)
+
+                    self.cur.execute("""
+                        INSERT INTO dwellings (id, rent, admin_fee, surface, walk_time, location, url)
+                        VALUES (DEFAULT, %s, %s, %s, %s, %s, %s);""", (p["rent"], p["admin_fee"], p["surface"], p["walk_time"], p["ward"], p["url"]))
+            self.conn.commit()
             # sys.stderr.write(str(len(props)) + "\n")
 
     def get_appt_info(self, apartment):
         prop = {}
+        prop["admin_fee"] = 0
+
         title = apartment.find("div", class_="listing-title")
         prop["ward"] = self.get_ward(title.get_text())
+        prop["url"] = "http://www.realestate.co.jp/" + title.find("a", href=True)['href']
 
         right_col = apartment.find("div", class_="listing-right-col")
         price = right_col.find_all("div", class_="listing-item")[1]
@@ -196,5 +212,11 @@ class Agharta(AbstractParser):
 
             page_number_text = [x.get_text() for x in soup.find("ul", class_="paginator").find_all("li") if u'\u4ef6' in x.get_text()]
             assert(len(page_number_text) > 0)
+
             return int(int(page_number_text[0].split(u'\u4ef6')[0]) / 15) + 1
 
+
+if __name__ == '__main__':
+    print("Tests")
+    ag = Agharta("https://www.realestate.co.jp/agharta/ja/rent?page=1")
+    ag.parse()
