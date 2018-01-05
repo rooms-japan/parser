@@ -18,8 +18,8 @@ agharta.load("data.txt")
 
 for p in agharta.props:
 	cur.execute("""
-		INSERT INTO dwellings (id, rent, admin_fee, surface, walk_time, location)
-		VALUES (DEFAULT, %s, %s, %s, %s, %s);""", (p["rent"], p["admin_fee"], p["surface"], p["walk_time"], p["ward"]))
+		INSERT INTO dwellings (id, rent, admin_fee, surface, walk_time, location, url)
+		VALUES (DEFAULT, %s, %s, %s, %s, %s, %s);""", (p["rent"], p["admin_fee"], p["surface"], p["walk_time"], p["ward"], p["url"]))
 	print(p)
 # print(len(agharta.props))
 

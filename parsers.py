@@ -1,9 +1,10 @@
 # coding: utf-8
-import ipdb
 import re
 import sys
 import urllib.request
+from multiprocessing import Pool
 from bs4 import BeautifulSoup
+from slugify import slugify
 from abc import ABC, abstractmethod
 import psycopg2
 
@@ -95,15 +96,9 @@ class AbstractParser(ABC):
         # TODO: If key not in dict ?
         return [i[_key] for i in self.props] 
 
-    def convert_price(self, string):
-        rent = string.split(u'\u4e07')
-        man = int(rent[0])
-        yen = rent[1].split(u'\u5186')[0]
-        if yen == "":
-            yen = 0
-        else:
-            yen = int(yen)
-        return (man*10000 + yen)
+    @staticmethod
+    def convert_price(string):
+        return int(re.sub('¥|,', '', string))
 
     def convert_surface(self, surf):
         return float(surf.replace(u'm\xb2', ''))
@@ -135,9 +130,11 @@ class AbstractParser(ABC):
 class Agharta(AbstractParser):
     def __init__(self, _url):
         super().__init__(_url)
+        self.table_cols = ['floor', 'max_floor', 'size', 'rent', 'maintenance_fee', 'deposit', 'key_money', 'layout', 'year_built', 'nearest_station', 'location', 'url']
 
     def parse(self):
         page_number = self.get_page_number()
+        finres = []
         # page_number = 1
 
         # Extract all pages
@@ -152,55 +149,65 @@ class Agharta(AbstractParser):
                 soup = BeautifulSoup(html_doc, "html.parser")
 
                 properties = soup.find_all("div", class_="property-listing")
-        
-                for apartment in properties:
-                    p = self.get_appt_info(apartment)
-                    print(p)
+                titles = [ a.find("div", class_="listing-title") for a in properties ]
+                # Get links        
+                urls = [ x.find("a", href=True)['href'] for x in titles ]
+                agents = 5
+                chunksize = 3
+                data = [i for i in range(0,15)]
+                with Pool(processes=agents) as pool: 
+                    res = pool.map(Agharta.insert_appt, urls, chunksize)
+                finres.extend(res)
+                print(len(finres))
+        for p in finres:
+            print(p)
+            self.cur.execute("""
+            INSERT INTO dwellings
+            (id, """ + ','.join(self.table_cols) +""")
+            VALUES (DEFAULT, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s);
+        """, [ p[i] for i in self.table_cols])
+        self.conn.commit()
 
-                    self.cur.execute("""
-                        INSERT INTO dwellings (id, rent, admin_fee, surface, walk_time, location, url)
-                        VALUES (DEFAULT, %s, %s, %s, %s, %s, %s);""", (p["rent"], p["admin_fee"], p["surface"], p["walk_time"], p["ward"], p["url"]))
-            self.conn.commit()
-            # sys.stderr.write(str(len(props)) + "\n")
+    @staticmethod
+    def insert_appt(url_apartment):
+        print(url_apartment)
+        with urllib.request.urlopen("http://www.realestate.co.jp" + url_apartment) as appt:
+            p = Agharta.get_appt_info(appt, url_apartment)
+            p['url'] = "http://www.realestate.co.jp" + url_apartment
+            return p
 
-    def get_appt_info(self, apartment):
+    @staticmethod
+    def get_appt_info(appt, url):
         prop = {}
-        prop["admin_fee"] = 0
+        prop_db = {'floor':0, 'max_floor':0}
+        appt_page = BeautifulSoup(appt.read(), "html.parser")
 
-        title = apartment.find("div", class_="listing-title")
-        prop["ward"] = self.get_ward(title.get_text())
-        prop["url"] = "http://www.realestate.co.jp/" + title.find("a", href=True)['href']
+        dl_data = appt_page.find_all("dd")
+        dt_data = appt_page.find_all("dt")
+        for dlitem, dtitem in zip(dl_data, dt_data):
+            # Do all "manual" parsing here
+            prop[slugify(dtitem.string)] = dlitem.getText().strip()
+        for p in prop:
+            if p == 'floor':
+                floors = re.findall(r'\d+', prop[p])
+                if len(floors) == 1:
+                    floors.append(floors[0])
+                (prop_db['floor'], prop_db['max_floor']) = map(int, floors)
+            if p == 'size':
+                prop_db[p] = float(re.findall(r'\d+\.\d+|\d+', prop[p])[0])
+            if p == 'nearest-station':
+                prop_db['nearest_station'] = int(str(min(re.findall(r'\d+', prop[p]))))
+            if 'year-built' in p:
+                prop_db['year_built'] = int(prop[p])
 
-        right_col = apartment.find("div", class_="listing-right-col")
-        price = right_col.find_all("div", class_="listing-item")[1]
-        infos = right_col.find_all("div", class_="listing-item")
-
-        for info in infos:
-            if u'\u8cc3\u6599' in info.get_text():
-                # Rent price
-                prop["rent"] = self.convert_price(info.get_text().split("\n")[1].replace("\t", ""))
-            elif u'\u9762\u7a4d' in info.get_text():
-                # Surface
-                prop["surface"] = self.convert_surface(info.get_text().split("\n")[1].replace("\t", ""))
-        more_infos = apartment.find("div", class_="listing-info").find_all("div", class_="listing-item")
-        for info in more_infos:
-            if u'\u7ba1\u7406\u8cbb' in info.get_text():
-                # Administration Fee
-                t = info.get_text().split("\n")[-1]
-                rep = {u'/':u'', u',':u'', u'\u6708':u'',u'\xa5':u'', u'\t':'', u' ':u''}
-                rep = dict((re.escape(k), v) for k, v in rep.items())
-                pattern = re.compile("|".join(rep.keys()))
-                t = pattern.sub(lambda m: rep[re.escape(m.group(0))], t)
-                prop["admin_fee"] = int(t)
-            elif u'\u5206' in info.get_text():
-                # Walk Time
-                walk_text = info.get_text().strip().split("\n")[-1]
-                rep = {u'\uff08':u'', u'\uff09':u'', u'\u5f92':u'',u'\u5206':u'', u'\u6b69':u'', u'\u30d0\u30b9\u3067':''} # Dernier : bus, retirer ?
-                rep = dict((re.escape(k), v) for k, v in rep.items())
-                pattern = re.compile("|".join(rep.keys()))
-                walk_time = pattern.sub(lambda m: rep[re.escape(m.group(0))], walk_text)
-                prop["walk_time"] = int(walk_time)
-        return prop
+        prop_db['location'] = prop['location']
+        prop_db['layout'] = prop['layout']
+        prop_db['rent'] = Agharta.convert_price(prop['rent'])
+        prop_db['maintenance_fee'] = Agharta.convert_price(prop['maintenance-fee'])
+        prop_db['deposit'] = Agharta.convert_price(prop['deposit'])
+        prop_db['key_money'] = Agharta.convert_price(prop['key-money'])
+        
+        return prop_db
 
     def get_page_number(self):
         # return 3
@@ -210,13 +217,13 @@ class Agharta(AbstractParser):
 
             soup = BeautifulSoup(html_doc, "html.parser")
 
-            page_number_text = [x.get_text() for x in soup.find("ul", class_="paginator").find_all("li") if u'\u4ef6' in x.get_text()]
+            page_number_text = [x.get_text() for x in soup.find("ul", class_="paginator").find_all("li") if u'of' in x.get_text()]
             assert(len(page_number_text) > 0)
 
-            return int(int(page_number_text[0].split(u'\u4ef6')[0]) / 15) + 1
+            return int(int(page_number_text[0].split(u'of')[1]) / 15) + 1
 
 
 if __name__ == '__main__':
     print("Tests")
-    ag = Agharta("https://www.realestate.co.jp/agharta/ja/rent?page=1")
+    ag = Agharta("https://www.realestate.co.jp/agharta/en/rent?page=1")
     ag.parse()
