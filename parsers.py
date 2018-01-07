@@ -1,11 +1,11 @@
 # coding: utf-8
 import re
 import sys
+from abc import ABC, abstractmethod
 import urllib.request
 from multiprocessing import Pool
 from bs4 import BeautifulSoup
 from slugify import slugify
-from abc import ABC, abstractmethod
 import psycopg2
 
 class AbstractParser(ABC):
@@ -14,75 +14,8 @@ class AbstractParser(ABC):
         self.props = []
         self.url = _url
 
-        # Connect to db
-        try:
-            self.conn = psycopg2.connect(dbname="rooms-japan", host="localhost", user="tiphaine", password="tiphsolange")
-            self.cur = self.conn.cursor()
-        except psycopg2.OperationalError as e:
-            print("Could not connect to database: {0}").format(e)
-            sys.exit(1)
-
-
-    def get_ward(self, string):
-        romaji_wards = [
-            "Chiyoda",
-            "Chūō",
-            "Minato",
-            "Shinjuku",
-            "Bunkyō",
-            "Taitō",
-            "Sumida",
-            "Kōtō",
-            "Shinagawa",
-            "Meguro",
-            "Ōta",
-            "Setagaya",
-            "Shibuya",
-            "Nakano",
-            "Suginami",
-            "Toshima",
-            "Kita",
-            "Arakawa",
-            "Itabashi",
-            "Nerima",
-            "Adachi",
-            "Katsushika",
-            "Edogawa"
-        ]
-        kanji_wards = [
-            "千代田区",
-            "中央区",
-            "港区",
-            "新宿区",
-            "文京区",
-            "台東区",
-            "墨田区",
-            "江東区",
-            "品川区",
-            "目黒区",
-            "大田区",
-            "世田谷区",
-            "渋谷区",
-            "中野区",
-            "杉並区",
-            "豊島区",
-            "北区",
-            "荒川区",
-            "板橋区",
-            "練馬区",
-            "足立区",
-            "葛飾区",
-            "江戸川区"
-        ]
-        res = [kanji_wards.index(x) for x in kanji_wards if x in string]
-        if len(res) == 0:
-            return "n/a"
-        assert(len(res) <= 1)
-        i = res[0]
-        return romaji_wards[i]
-
     @abstractmethod
-    def parse(self): 
+    def parse(self):
         raise NotImplementedError("parse() must be overriden.")
 
     def print(self, out):
@@ -92,16 +25,13 @@ class AbstractParser(ABC):
             for key in self.props:
                 f.write("\t".join(map(str, [key[x] for x in prop_keys])) + "\n")
 
-    def get_key(self, _key):
-        # TODO: If key not in dict ?
-        return [i[_key] for i in self.props] 
-
     @staticmethod
     def convert_price(string):
+        """
+            Converts a string price in yens into an integer.
+            e.g. given the string "20,000¥", returns 20000
+        """
         return int(re.sub('¥|,', '', string))
-
-    def convert_surface(self, surf):
-        return float(surf.replace(u'm\xb2', ''))
 
     def get_appt_info(self, apartment):
         raise NotImplementedError("get_appt_info() must be overriden.")
@@ -109,33 +39,28 @@ class AbstractParser(ABC):
     def get_page_number(self):
         raise NotImplementedError("get_page_number() must be overriden.")
 
-    def load(self, infile):
-        header = True
-        with open(infile) as f:
-            for line in f:
-                if header:
-                    # Read keys
-                    keys = line.split()
-                    header = False
-                else:
-                    entry = {}
-                    contents = [x.strip() for x in line.split()]
-                    for i in range(0, len(keys)):
-                        if keys[i] == "ward":
-                            entry[keys[i]] = str(contents[i])
-                        else:
-                            entry[keys[i]] = float(contents[i])
-                    self.props.append(entry)
-
 class Agharta(AbstractParser):
     def __init__(self, _url):
         super().__init__(_url)
-        self.table_cols = ['floor', 'max_floor', 'size', 'rent', 'maintenance_fee', 'deposit', 'key_money', 'layout', 'year_built', 'nearest_station', 'location', 'url']
+        self.table_cols = ['floor', 'max_floor', 'size', 'rent',\
+                           'maintenance_fee', 'deposit', 'key_money',\
+                           'layout', 'year_built', 'nearest_station',\
+                           'location', 'url']
+
+    def get_table_cols(self):
+        """
+            Returns the names of the columns to be inserted in the database.
+        """
+        return self.table_cols
 
     def parse(self):
+        """
+            Parses the url, extracts all listings and parallelize listing parsing.
+
+            Returns the list of parsed listings
+        """
         page_number = self.get_page_number()
-        finres = []
-        # page_number = 1
+        prop_list = []
 
         # Extract all pages
         for i in range(1, page_number + 1):
@@ -143,87 +68,102 @@ class Agharta(AbstractParser):
 
             url = self.url + "&page=" + str(i)
             with urllib.request.urlopen(url) as f:
-                # f = open("test.html")
-                html_doc = f.read()
+                soup = BeautifulSoup(f.read(), "html.parser")
 
-                soup = BeautifulSoup(html_doc, "html.parser")
+                # Extract properties on page without taking the "Featured" listing if it exists
+                properties = [p for p in \
+                              soup.find_all("div", class_="property-listing")\
+                              if not p.find("div", class_="listing-featured")]
+                titles = [a.find("div", class_="listing-title") for a in properties]
 
-                properties = soup.find_all("div", class_="property-listing")
-                titles = [ a.find("div", class_="listing-title") for a in properties ]
-                # Get links        
-                urls = [ x.find("a", href=True)['href'] for x in titles ]
+                # Get links to detailed apartment page
+                urls = [x.find("a", href=True)['href'] for x in titles]
                 agents = 5
                 chunksize = 3
-                data = [i for i in range(0,15)]
-                with Pool(processes=agents) as pool: 
-                    res = pool.map(Agharta.insert_appt, urls, chunksize)
-                finres.extend(res)
-                print(len(finres))
-        for p in finres:
-            print(p)
-            self.cur.execute("""
-            INSERT INTO dwellings
-            (id, """ + ','.join(self.table_cols) +""")
-            VALUES (DEFAULT, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s);
-        """, [ p[i] for i in self.table_cols])
-        self.conn.commit()
+                with Pool(processes=agents) as pool:
+                    res = pool.map(Agharta.get_appt_info, urls, chunksize)
+                prop_list.extend(res)
+        return prop_list
 
     @staticmethod
-    def insert_appt(url_apartment):
-        print(url_apartment)
-        with urllib.request.urlopen("http://www.realestate.co.jp" + url_apartment) as appt:
-            p = Agharta.get_appt_info(appt, url_apartment)
-            p['url'] = "http://www.realestate.co.jp" + url_apartment
-            return p
+    def get_appt_info(url):
+        """
+            Given the url of a detailed listing, extract the relevant information.
 
-    @staticmethod
-    def get_appt_info(appt, url):
+            Returns a dictionary.
+        """
         prop = {}
-        prop_db = {'floor':0, 'max_floor':0}
-        appt_page = BeautifulSoup(appt.read(), "html.parser")
+        prop_db = {'floor': 0, 'max_floor': 0}
+        with urllib.request.urlopen("http://www.realestate.co.jp" + url) as appt:
+            appt_page = BeautifulSoup(appt.read(), "html.parser")
 
-        dl_data = appt_page.find_all("dd")
-        dt_data = appt_page.find_all("dt")
-        for dlitem, dtitem in zip(dl_data, dt_data):
-            # Do all "manual" parsing here
-            prop[slugify(dtitem.string)] = dlitem.getText().strip()
-        for p in prop:
-            if p == 'floor':
-                floors = re.findall(r'\d+', prop[p])
-                if len(floors) == 1:
-                    floors.append(floors[0])
-                (prop_db['floor'], prop_db['max_floor']) = map(int, floors)
-            if p == 'size':
-                prop_db[p] = float(re.findall(r'\d+\.\d+|\d+', prop[p])[0])
-            if p == 'nearest-station':
-                prop_db['nearest_station'] = int(str(min(re.findall(r'\d+', prop[p]))))
-            if 'year-built' in p:
-                prop_db['year_built'] = int(prop[p])
+            dl_data = appt_page.find_all("dd")
+            dt_data = appt_page.find_all("dt")
+            for dlitem, dtitem in zip(dl_data, dt_data):
+                # Do all "manual" parsing here
+                prop[slugify(dtitem.string)] = dlitem.getText().strip()
+            for p in prop:
+                if p == 'floor':
+                    floors = re.findall(r'\d+', prop[p])
+                    if len(floors) == 1:
+                        floors.append(floors[0])
+                    (prop_db['floor'], prop_db['max_floor']) = map(int, floors)
+                if p == 'size':
+                    prop_db[p] = float(re.findall(r'\d+\.\d+|\d+', prop[p])[0])
+                if p == 'nearest-station':
+                    prop_db['nearest_station'] = int(str(min(re.findall(r'\d+', prop[p]))))
+                if 'year-built' in p:
+                    prop_db['year_built'] = int(prop[p])
 
-        prop_db['location'] = prop['location']
-        prop_db['layout'] = prop['layout']
-        prop_db['rent'] = Agharta.convert_price(prop['rent'])
-        prop_db['maintenance_fee'] = Agharta.convert_price(prop['maintenance-fee'])
-        prop_db['deposit'] = Agharta.convert_price(prop['deposit'])
-        prop_db['key_money'] = Agharta.convert_price(prop['key-money'])
-        
+            prop_db['location'] = prop['location']
+            prop_db['layout'] = prop['layout']
+            prop_db['rent'] = Agharta.convert_price(prop['rent'])
+            prop_db['maintenance_fee'] = Agharta.convert_price(prop['maintenance-fee'])
+            prop_db['deposit'] = Agharta.convert_price(prop['deposit'])
+            prop_db['key_money'] = Agharta.convert_price(prop['key-money'])
+            prop_db['url'] = "http://www.realestate.co.jp" + url
+
         return prop_db
 
     def get_page_number(self):
-        # return 3
+        """
+            Return the number of pages to parse, assuming 15 listings per page
+        """
         with urllib.request.urlopen(self.url) as f:
-            # html_doc = open("test.html").read()
             html_doc = f.read()
 
             soup = BeautifulSoup(html_doc, "html.parser")
 
-            page_number_text = [x.get_text() for x in soup.find("ul", class_="paginator").find_all("li") if u'of' in x.get_text()]
-            assert(len(page_number_text) > 0)
+            page_number_text = [x.get_text() for x in\
+                                soup.find("ul", class_="paginator").find_all("li")\
+                                if u'of' in x.get_text()]
+            assert len(page_number_text) > 0
 
             return int(int(page_number_text[0].split(u'of')[1]) / 15) + 1
 
 
 if __name__ == '__main__':
-    print("Tests")
-    ag = Agharta("https://www.realestate.co.jp/agharta/en/rent?page=1")
-    ag.parse()
+    # Connect to db
+    try:
+        conn = psycopg2.connect(dbname="rooms-japan",\
+                                host="localhost",\
+                                user="tiphaine",\
+                                password="tiphsolange")
+        cur = conn.cursor()
+    except psycopg2.OperationalError as e:
+        print("Could not connect to database: {0}").format(e)
+        sys.exit(1)
+
+    ag = Agharta("https://www.realestate.co.jp/rent/listing?prefecture=JP-13&page=1")
+    table_cols = ag.get_table_cols()
+
+    properties_listing = ag.parse()
+    print("Parsing finished. Inserting in database...")
+    for prop in properties_listing:
+        cur.execute("""
+        INSERT INTO dwellings
+        (id, """ + ','.join(table_cols) +""")
+        VALUES (DEFAULT, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s);
+    """, [ prop[i] for i in table_cols])
+    conn.commit()
+    print("Finished.  Happy exploration :)")
